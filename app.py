@@ -11,13 +11,15 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, Form, HTTPException
+from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, Response
 
 app = FastAPI()
 
+# Image formats to catch
 IMG_RE = re.compile(r"\.(jpe?g|png|webp|gif|svg|avif)(\?.*)?$", re.IGNORECASE)
 
+# Token store (good enough for personal tool; resets if Render restarts)
 RESULTS = {}
 TOKEN_TTL_SECONDS = 15 * 60  # 15 minutes
 
@@ -86,12 +88,15 @@ def extract_image_urls(page_url: str, html: str):
         if IMG_RE.search(abs_u):
             found.append(abs_u)
 
+    # <a href="...jpg/png/etc">
     for a in soup.select("a[href]"):
         add(a.get("href", ""))
 
+    # <img> tags: src, srcset, and common lazy-load attrs
     for img in soup.select("img"):
         add(img.get("src", ""))
 
+        # srcset: pick the biggest candidate
         srcset = img.get("srcset", "") or ""
         if srcset:
             best_url = None
@@ -108,12 +113,12 @@ def extract_image_urls(page_url: str, html: str):
                     if token.endswith("w"):
                         try:
                             score = int(token[:-1])
-                        except:
+                        except Exception:
                             score = 0
                     elif token.endswith("x"):
                         try:
                             score = int(float(token[:-1]) * 1000)
-                        except:
+                        except Exception:
                             score = 0
                 if score > best_score:
                     best_score = score
@@ -139,7 +144,7 @@ def extract_image_urls(page_url: str, html: str):
                     if len(bits) > 1 and bits[1].endswith("w"):
                         try:
                             w = int(bits[1][:-1])
-                        except:
+                        except Exception:
                             w = 0
                     if w > best_w:
                         best_w = w
@@ -147,25 +152,55 @@ def extract_image_urls(page_url: str, html: str):
                 if best_url:
                     add(best_url)
 
+    # OG/Twitter preview images
     for meta in soup.select('meta[property="og:image"], meta[name="twitter:image"]'):
         add(meta.get("content", ""))
 
-    for link in soup.select(
-        'link[rel~="icon"], link[rel="apple-touch-icon"], link[rel="apple-touch-icon-precomposed"]'
-    ):
+    # Icons (sometimes useful, but filtered out if "Hide assets" is enabled)
+    for link in soup.select('link[rel~="icon"], link[rel="apple-touch-icon"], link[rel="apple-touch-icon-precomposed"]'):
         add(link.get("href", ""))
 
+    # Inline CSS background images
     for el in soup.select("[style]"):
         style = el.get("style", "") or ""
         for m in re.finditer(r"url\(([^)]+)\)", style, re.IGNORECASE):
             raw = m.group(1).strip().strip('"').strip("'")
             add(raw)
 
+    # Dedup keep order
     return list(dict.fromkeys(found))
 
 
-def render_home(token: str = "", error: str = "", url_prefill: str = "", name_prefill: str = "") -> str:
+ASSET_KEYWORDS = [
+    "logo", "logos", "favicon", "icon", "icons", "sprite", "badge",
+    "apple-touch-icon", "android-chrome", "mstile", "site.webmanifest",
+    "visa", "mastercard", "amex", "paypal", "klarna", "stripe",
+    "facebook", "instagram", "linkedin", "twitter", "tiktok", "youtube", "pinterest",
+    "cookie", "cookies", "gdpr", "consent",
+]
+
+def looks_like_site_asset(image_url: str) -> bool:
+    u = image_url.lower()
+    path = urlparse(u).path or ""
+    filename = os.path.basename(path)
+
+    # common favicon/icon paths
+    if "favicon" in u or "/icons/" in u or "/icon/" in u:
+        return True
+    if filename in ["favicon.ico", "favicon.png", "favicon.svg"]:
+        return True
+
+    # keyword based
+    for k in ASSET_KEYWORDS:
+        if k in u:
+            return True
+
+    return False
+
+
+def render_home(token: str = "", thumb: int = 0, error: str = "", url_prefill: str = "", name_prefill: str = "") -> str:
     cleanup_old_results()
+
     results_section = ""
     if token:
         data = RESULTS.get(token)
@@ -176,31 +211,55 @@ def render_home(token: str = "", error: str = "", url_prefill: str = "", name_pr
             count = len(images)
             page_url = data["url"]
             zip_name = data["name"] + ".zip"
+            hide_assets = data.get("hide_assets", False)
 
-            # list items (cap at 500 for sanity)
+            toggle_thumb = 0 if thumb else 1
+            toggle_label = "Show thumbnails" if not thumb else "Hide thumbnails"
+
             rows = ""
             for idx, img_url in enumerate(images[:500]):
                 filename = os.path.basename(urlparse(img_url).path) or f"image-{idx+1}"
+
+                thumb_html = ""
+                if thumb:
+                    thumb_html = f"""
+                      <div class="thumb">
+                        <img src="{img_url}" alt="{filename}" loading="lazy">
+                      </div>
+                    """
+
                 rows += f"""
                   <div class="item">
-                    <div class="fn">{filename}</div>
-                    <div class="actions">
-                      <a class="btn" target="_blank" rel="noopener" href="/view/{token}/{idx}">View</a>
-                      <a class="btn ghost" href="/one/{token}/{idx}">Download</a>
+                    {thumb_html}
+                    <div class="main">
+                      <div class="fn">{filename}</div>
+                      <div class="actions">
+                        <a class="btn" target="_blank" rel="noopener" href="/view/{token}/{idx}?thumb={thumb}">View</a>
+                        <a class="btn ghost" href="/one/{token}/{idx}">Download</a>
+                      </div>
                     </div>
                   </div>
                 """
+
+            filter_note = "Hide site assets: On" if hide_assets else "Hide site assets: Off"
 
             results_section = f"""
             <div class="results">
               <div class="resultsHead">
                 <div class="pill">{count} images found</div>
-                <div class="meta">Source page: <a href="{page_url}" target="_blank" rel="noopener">Open</a></div>
+                <div class="meta">
+                  Source page: <a href="{page_url}" target="_blank" rel="noopener">Open</a>
+                  <span class="sep">•</span>
+                  {filter_note}
+                </div>
               </div>
 
               <div class="ctaRow">
                 <a class="btn primary" href="/download/{token}">Download all images (ZIP)</a>
-                <div class="zipnote">ZIP name: <code>{zip_name}</code></div>
+                <div class="right">
+                  <a class="btn ghost" href="/?t={token}&thumb={toggle_thumb}">{toggle_label}</a>
+                  <div class="zipnote">ZIP name: <code>{zip_name}</code></div>
+                </div>
               </div>
 
               <div class="list">
@@ -225,39 +284,53 @@ def render_home(token: str = "", error: str = "", url_prefill: str = "", name_pr
   .card {{ background: #f6f6f7; border: 1px solid #e6e6ea; border-radius: 16px; padding: 18px; }}
   label {{ display: block; font-weight: 600; margin: 10px 0 8px; font-size: 13px; }}
   input[type=text] {{ width: 100%; box-sizing: border-box; padding: 12px 14px; font-size: 15px; border-radius: 12px; border: 1px solid #cfcfd6; }}
+  .small {{ font-size: 12px; color: #777; margin-top: 10px; line-height: 1.35; }}
   .row {{ display: flex; gap: 10px; margin-top: 14px; align-items: center; flex-wrap: wrap; }}
-  .btn {{ display: inline-block; padding: 10px 14px; font-size: 14px; border-radius: 12px; border: 1px solid #111; background: #fff; color: #111; text-decoration: none; }}
-  .btn:hover {{ opacity: .9; }}
-  .primary {{ background: #111; color: #fff; }}
-  .ghost {{ border-color: #cfcfd6; }}
   button {{ padding: 12px 16px; font-size: 15px; border-radius: 12px; border: 1px solid #111; background: #111; color: #fff; cursor: pointer; }}
   button:disabled {{ opacity: .6; cursor: not-allowed; }}
-  .small {{ font-size: 12px; color: #777; margin-top: 10px; line-height: 1.35; }}
-  .footer {{ margin-top: 18px; font-size: 12px; color: #777; }}
   .spinner {{ width: 16px; height: 16px; border: 2px solid #ddd; border-top: 2px solid #111; border-radius: 50%; display: none; animation: spin .9s linear infinite; }}
   @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
   .status {{ font-size: 13px; display:none; color: #333; }}
   .error {{ margin-top: 14px; padding: 12px 14px; border: 1px solid #f3c6c6; background: #fff5f5; color: #8a1f1f; border-radius: 12px; font-size: 13px; }}
+
+  .checkrow {{ display:flex; gap:10px; align-items:center; margin-top: 12px; }}
+  .checkrow input {{ transform: scale(1.1); }}
+  .checkrow label {{ margin: 0; font-weight: 500; font-size: 13px; }}
+
   .results {{ margin-top: 18px; }}
   .resultsHead {{ display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }}
   .pill {{ background: #111; color: #fff; padding: 6px 10px; border-radius: 999px; font-size: 12px; }}
   .meta {{ font-size: 12px; color: #666; }}
   .meta a {{ color: #0b57d0; text-decoration: none; }}
+  .sep {{ margin: 0 8px; }}
+
+  .btn {{ display: inline-block; padding: 10px 14px; font-size: 14px; border-radius: 12px; border: 1px solid #111; background: #fff; color: #111; text-decoration: none; }}
+  .btn:hover {{ opacity: .92; }}
+  .primary {{ background: #111; color: #fff; }}
+  .ghost {{ border-color: #cfcfd6; }}
+
   .ctaRow {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 12px 0; }}
+  .right {{ display:flex; gap: 10px; align-items:center; flex-wrap: wrap; }}
   .zipnote {{ font-size: 12px; color: #666; }}
   code {{ background: #eee; padding: 2px 6px; border-radius: 8px; }}
+
   .list {{ background: #fff; border: 1px solid #e6e6ea; border-radius: 16px; overflow: hidden; }}
-  .item {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 14px; border-top: 1px solid #f0f0f3; }}
+  .item {{ display: flex; gap: 12px; padding: 10px 14px; border-top: 1px solid #f0f0f3; }}
   .item:first-child {{ border-top: 0; }}
-  .fn {{ font-size: 13px; color: #111; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 640px; }}
+  .thumb {{ width: 72px; height: 54px; border-radius: 10px; overflow: hidden; border: 1px solid #eee; flex-shrink: 0; background: #fafafa; display:flex; align-items:center; justify-content:center; }}
+  .thumb img {{ width: 100%; height: 100%; object-fit: cover; display:block; }}
+  .main {{ display:flex; align-items:center; justify-content: space-between; gap: 12px; width: 100%; }}
+  .fn {{ font-size: 13px; color: #111; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 620px; }}
   .actions {{ display: flex; gap: 8px; flex-shrink: 0; }}
   .empty {{ padding: 14px; font-size: 13px; color: #666; }}
+
+  .footer {{ margin-top: 18px; font-size: 12px; color: #777; }}
 </style>
 </head>
 <body>
 
 <h1>Gallery Grabber</h1>
-<p>Paste a page URL. It finds all image URLs on that page and lets you download everything as a ZIP, or grab single images.</p>
+<p>Paste a page URL. It finds image URLs on that page and lets you download everything as a ZIP, or grab single images.</p>
 
 <div class="card">
   <form id="form" method="post" action="/scan">
@@ -270,18 +343,22 @@ def render_home(token: str = "", error: str = "", url_prefill: str = "", name_pr
       Leave blank and it’ll auto-name from the URL. Your browser will save to Downloads unless you’ve enabled “Ask where to save each file”.
     </div>
 
+    <div class="checkrow">
+      <input id="hide_assets" name="hide_assets" type="checkbox" value="1" checked>
+      <label for="hide_assets">Hide logos, favicons, social icons, payment badges</label>
+    </div>
+
     <div class="row">
       <button id="btn" type="submit">Find images</button>
       <div class="spinner" id="spin"></div>
       <div class="status" id="status">Fetching and scanning…</div>
     </div>
     {err_html}
+    <div class="footer">Tool by RIMANO</div>
   </form>
 </div>
 
 {results_section}
-
-<div class="footer">Tool by RIMANO</div>
 
 <script>
 const form = document.getElementById("form");
@@ -301,12 +378,12 @@ form.addEventListener("submit", () => {{
 
 
 @app.get("/", response_class=HTMLResponse)
-def home():
-    return render_home()
+def home(t: str = "", thumb: int = 0):
+    return render_home(token=t, thumb=thumb)
 
 
 @app.post("/scan")
-def scan(url: str = Form(...), name: str = Form("")):
+def scan(url: str = Form(...), name: str = Form(""), hide_assets: str = Form("")):
     cleanup_old_results()
     s = build_session()
 
@@ -319,28 +396,23 @@ def scan(url: str = Form(...), name: str = Form("")):
 
     images = extract_image_urls(url, page.text)
 
+    hide = bool(hide_assets)
+    if hide and images:
+        images = [u for u in images if not looks_like_site_asset(u)]
+
     final_name = (name or "").strip() or default_zip_name_from_url(url)
     final_name = safe_zip_name(final_name)
 
     token = uuid.uuid4().hex
-    RESULTS[token] = {"created": time.time(), "url": url, "name": final_name, "images": images}
+    RESULTS[token] = {
+        "created": time.time(),
+        "url": url,
+        "name": final_name,
+        "images": images,
+        "hide_assets": hide,
+    }
 
-    return RedirectResponse(url=f"/?t={token}", status_code=303)
-
-
-@app.get("/", response_class=HTMLResponse)
-def home_with_token(t: str = ""):
-    # FastAPI will route this to the first matching handler; to keep it simple,
-    # we merge behaviour by checking query param manually in a single handler above.
-    return render_home(token=t)
-
-
-# FastAPI route resolution: keep a single / handler for query param
-# (Workaround: override by alias route)
-app.router.routes = [r for r in app.router.routes if not (getattr(r, "path", None) == "/" and getattr(r, "methods", None) == {"GET"})]
-@app.get("/", response_class=HTMLResponse)
-def home_get(t: str = ""):
-    return render_home(token=t)
+    return RedirectResponse(url=f"/?t={token}&thumb=0", status_code=303)
 
 
 @app.get("/download/{token}")
@@ -400,7 +472,7 @@ def download_one(token: str, idx: int):
 
 
 @app.get("/view/{token}/{idx}", response_class=HTMLResponse)
-def view_one(token: str, idx: int):
+def view_one(token: str, idx: int, thumb: int = 0):
     cleanup_old_results()
     data = RESULTS.get(token)
     if not data:
@@ -433,7 +505,7 @@ img {{ margin-top: 16px; max-width: 100%; height: auto; border-radius: 14px; bor
   <div class="top">
     <h1>{filename}</h1>
     <div>
-      <a class="btn" href="/?t={token}">Back to results</a>
+      <a class="btn" href="/?t={token}&thumb={thumb}">Back to results</a>
       <a class="btn primary" href="/one/{token}/{idx}">Download this image</a>
     </div>
   </div>
