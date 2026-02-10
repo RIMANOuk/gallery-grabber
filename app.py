@@ -59,7 +59,11 @@ button:disabled { opacity: .6; cursor: not-allowed; }
   <input name="url" type="text" required placeholder="https://example.com/page-or-gallery">
 
   <label>ZIP name (optional)</label>
-  <input name="name" type="text" placeholder="event-name">
+ <input name="name" type="text" placeholder="">
+<div class="small">
+Leave blank to auto-name from the page URL (e.g. domain-page.zip).  
+Your browser will save the file to your Downloads folder unless you choose another location.
+</div>
 
   <div class="row">
     <button id="btn" type="submit">Find images</button>
@@ -296,8 +300,7 @@ li {{ margin: 10px 0; }}
 <div class="card">
   <div class="toprow">
     <div class="badge">{count} images found</div>
-    <div class="small">ZIP name: <code>{final_name}.zip</code></div>
-  </div>
+<div class="small">ZIP name (auto-generated): <code>{final_name}.zip</code></div>  </div>
 
   <p class="small">Page: <a href="{url}" target="_blank" rel="noopener">{url}</a></p>
   {note}
