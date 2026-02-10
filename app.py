@@ -11,15 +11,13 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, Form
+from fastapi import FastAPI, Form, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, Response
 
 app = FastAPI()
 
-# Image formats to catch
 IMG_RE = re.compile(r"\.(jpe?g|png|webp|gif|svg|avif)(\?.*)?$", re.IGNORECASE)
 
-# Token store (good enough for personal tool; resets if Render restarts)
 RESULTS = {}
 TOKEN_TTL_SECONDS = 15 * 60  # 15 minutes
 
@@ -88,15 +86,12 @@ def extract_image_urls(page_url: str, html: str):
         if IMG_RE.search(abs_u):
             found.append(abs_u)
 
-    # <a href="...jpg/png/etc">
     for a in soup.select("a[href]"):
         add(a.get("href", ""))
 
-    # <img> tags: src, srcset, and common lazy-load attrs
     for img in soup.select("img"):
         add(img.get("src", ""))
 
-        # srcset: pick the biggest candidate
         srcset = img.get("srcset", "") or ""
         if srcset:
             best_url = None
@@ -152,22 +147,20 @@ def extract_image_urls(page_url: str, html: str):
                 if best_url:
                     add(best_url)
 
-    # OG/Twitter preview images
     for meta in soup.select('meta[property="og:image"], meta[name="twitter:image"]'):
         add(meta.get("content", ""))
 
-    # Icons (sometimes useful, but filtered out if "Hide assets" is enabled)
-    for link in soup.select('link[rel~="icon"], link[rel="apple-touch-icon"], link[rel="apple-touch-icon-precomposed"]'):
+    for link in soup.select(
+        'link[rel~="icon"], link[rel="apple-touch-icon"], link[rel="apple-touch-icon-precomposed"]'
+    ):
         add(link.get("href", ""))
 
-    # Inline CSS background images
     for el in soup.select("[style]"):
         style = el.get("style", "") or ""
         for m in re.finditer(r"url\(([^)]+)\)", style, re.IGNORECASE):
             raw = m.group(1).strip().strip('"').strip("'")
             add(raw)
 
-    # Dedup keep order
     return list(dict.fromkeys(found))
 
 
@@ -183,18 +176,13 @@ def looks_like_site_asset(image_url: str) -> bool:
     u = image_url.lower()
     path = urlparse(u).path or ""
     filename = os.path.basename(path)
-
-    # common favicon/icon paths
     if "favicon" in u or "/icons/" in u or "/icon/" in u:
         return True
     if filename in ["favicon.ico", "favicon.png", "favicon.svg"]:
         return True
-
-    # keyword based
     for k in ASSET_KEYWORDS:
         if k in u:
             return True
-
     return False
 
 
@@ -215,6 +203,7 @@ def render_home(token: str = "", thumb: int = 0, error: str = "", url_prefill: s
 
             toggle_thumb = 0 if thumb else 1
             toggle_label = "Show thumbnails" if not thumb else "Hide thumbnails"
+            filter_note = "Hide site assets: On" if hide_assets else "Hide site assets: Off"
 
             rows = ""
             for idx, img_url in enumerate(images[:500]):
@@ -230,18 +219,19 @@ def render_home(token: str = "", thumb: int = 0, error: str = "", url_prefill: s
 
                 rows += f"""
                   <div class="item">
+                    <div class="chk">
+                      <input class="pick" type="checkbox" name="idx" value="{idx}">
+                    </div>
                     {thumb_html}
                     <div class="main">
                       <div class="fn">{filename}</div>
                       <div class="actions">
-                        <a class="btn" target="_blank" rel="noopener" href="/view/{token}/{idx}?thumb={thumb}">View</a>
+                        <a class="btn" href="/view/{token}/{idx}?thumb={thumb}">View</a>
                         <a class="btn ghost" href="/one/{token}/{idx}">Download</a>
                       </div>
                     </div>
                   </div>
                 """
-
-            filter_note = "Hide site assets: On" if hide_assets else "Hide site assets: Off"
 
             results_section = f"""
             <div class="results">
@@ -256,16 +246,68 @@ def render_home(token: str = "", thumb: int = 0, error: str = "", url_prefill: s
 
               <div class="ctaRow">
                 <a class="btn primary" href="/download/{token}">Download all images (ZIP)</a>
+
+                <form method="post" action="/download-selected/{token}" class="inlineForm" id="selectedForm">
+                  <button class="btn ghost" type="submit" id="btnSelected" disabled>Download selected (ZIP)</button>
+                  <input type="hidden" name="thumb" value="{thumb}">
+                </form>
+
                 <div class="right">
                   <a class="btn ghost" href="/?t={token}&thumb={toggle_thumb}">{toggle_label}</a>
                   <div class="zipnote">ZIP name: <code>{zip_name}</code></div>
                 </div>
               </div>
 
-              <div class="list">
-                {rows if count else "<div class='empty'>No images found on that page.</div>"}
+              <div class="tools">
+                <label class="tool">
+                  <input type="checkbox" id="selectAll">
+                  Select all
+                </label>
+                <span class="toolHint" id="selCount">0 selected</span>
               </div>
+
+              <form method="post" action="/download-selected/{token}" id="listForm">
+                <input type="hidden" name="thumb" value="{thumb}">
+                <div class="list">
+                  {rows if count else "<div class='empty'>No images found on that page.</div>"}
+                </div>
+              </form>
             </div>
+
+            <script>
+              (function() {{
+                const listForm = document.getElementById("listForm");
+                const selectedForm = document.getElementById("selectedForm");
+                const selectAll = document.getElementById("selectAll");
+                const picks = () => Array.from(document.querySelectorAll(".pick"));
+                const selCount = document.getElementById("selCount");
+                const btnSelected = document.getElementById("btnSelected");
+
+                function update() {{
+                  const checked = picks().filter(x => x.checked).length;
+                  selCount.textContent = checked + " selected";
+                  btnSelected.disabled = checked === 0;
+                  selectAll.checked = checked > 0 && checked === picks().length;
+                }}
+
+                selectAll.addEventListener("change", () => {{
+                  picks().forEach(x => x.checked = selectAll.checked);
+                  update();
+                }});
+
+                document.addEventListener("change", (e) => {{
+                  if (e.target && e.target.classList.contains("pick")) update();
+                }});
+
+                // When "Download selected" is clicked, submit the listForm so the selected checkboxes are included
+                selectedForm.addEventListener("submit", (e) => {{
+                  e.preventDefault();
+                  listForm.submit();
+                }});
+
+                update();
+              }})();
+            </script>
             """
 
     err_html = f"<div class='error'>{error}</div>" if error else ""
@@ -309,28 +351,34 @@ def render_home(token: str = "", thumb: int = 0, error: str = "", url_prefill: s
   .primary {{ background: #111; color: #fff; }}
   .ghost {{ border-color: #cfcfd6; }}
 
-  .ctaRow {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 12px 0; }}
-  .right {{ display:flex; gap: 10px; align-items:center; flex-wrap: wrap; }}
+  .ctaRow {{ display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 12px 0; }}
+  .right {{ display:flex; gap: 10px; align-items:center; flex-wrap: wrap; margin-left: auto; }}
   .zipnote {{ font-size: 12px; color: #666; }}
   code {{ background: #eee; padding: 2px 6px; border-radius: 8px; }}
 
+  .tools {{ display:flex; align-items:center; gap: 12px; margin: 10px 0; }}
+  .tool {{ font-size: 13px; color:#111; display:flex; align-items:center; gap:8px; }}
+  .toolHint {{ font-size: 12px; color:#666; }}
+
   .list {{ background: #fff; border: 1px solid #e6e6ea; border-radius: 16px; overflow: hidden; }}
-  .item {{ display: flex; gap: 12px; padding: 10px 14px; border-top: 1px solid #f0f0f3; }}
+  .item {{ display: flex; gap: 12px; padding: 10px 14px; border-top: 1px solid #f0f0f3; align-items: center; }}
   .item:first-child {{ border-top: 0; }}
+  .chk {{ width: 20px; flex-shrink: 0; display:flex; justify-content:center; }}
   .thumb {{ width: 72px; height: 54px; border-radius: 10px; overflow: hidden; border: 1px solid #eee; flex-shrink: 0; background: #fafafa; display:flex; align-items:center; justify-content:center; }}
   .thumb img {{ width: 100%; height: 100%; object-fit: cover; display:block; }}
   .main {{ display:flex; align-items:center; justify-content: space-between; gap: 12px; width: 100%; }}
-  .fn {{ font-size: 13px; color: #111; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 620px; }}
+  .fn {{ font-size: 13px; color: #111; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 560px; }}
   .actions {{ display: flex; gap: 8px; flex-shrink: 0; }}
   .empty {{ padding: 14px; font-size: 13px; color: #666; }}
 
   .footer {{ margin-top: 18px; font-size: 12px; color: #777; }}
+  .inlineForm {{ margin: 0; }}
 </style>
 </head>
 <body>
 
 <h1>Gallery Grabber</h1>
-<p>Paste a page URL. It finds image URLs on that page and lets you download everything as a ZIP, or grab single images.</p>
+<p>Paste a page URL. It finds image URLs on that page and lets you download everything as a ZIP, or grab selected images.</p>
 
 <div class="card">
   <form id="form" method="post" action="/scan">
@@ -446,6 +494,48 @@ def download_all(token: str):
     return FileResponse(zip_path, filename=f"{data['name']}.zip")
 
 
+@app.post("/download-selected/{token}")
+def download_selected(token: str, idx: list[int] = Form(default=[]), thumb: int = Form(default=0)):
+    cleanup_old_results()
+    data = RESULTS.get(token)
+    if not data:
+        raise HTTPException(status_code=404, detail="That session has expired. Run the scan again.")
+
+    images = data["images"]
+    if not images:
+        raise HTTPException(status_code=400, detail="No images to download for that session.")
+
+    # sanitise selection
+    picked = []
+    for i in idx:
+        if isinstance(i, int) and 0 <= i < len(images):
+            picked.append(i)
+    picked = list(dict.fromkeys(picked))
+
+    if not picked:
+        return RedirectResponse(url=f"/?t={token}&thumb={thumb}", status_code=303)
+
+    s = build_session()
+    tmpdir = tempfile.mkdtemp()
+    zip_path = os.path.join(tmpdir, f"{data['name']}-selected.zip")
+
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for i in picked:
+            img_url = images[i]
+            try:
+                r = s.get(img_url, timeout=30, allow_redirects=True)
+                r.raise_for_status()
+                filename = os.path.basename(urlparse(img_url).path) or f"image-{i+1}"
+                file_path = os.path.join(tmpdir, filename)
+                with open(file_path, "wb") as f:
+                    f.write(r.content)
+                z.write(file_path, filename)
+            except Exception:
+                continue
+
+    return FileResponse(zip_path, filename=f"{data['name']}-selected.zip")
+
+
 @app.get("/one/{token}/{idx}")
 def download_one(token: str, idx: int):
     cleanup_old_results()
@@ -484,6 +574,7 @@ def view_one(token: str, idx: int, thumb: int = 0):
 
     img_url = images[idx]
     filename = os.path.basename(urlparse(img_url).path) or "image"
+
     return f"""
 <!doctype html>
 <html>
@@ -507,10 +598,12 @@ img {{ margin-top: 16px; max-width: 100%; height: auto; border-radius: 14px; bor
     <div>
       <a class="btn" href="/?t={token}&thumb={thumb}">Back to results</a>
       <a class="btn primary" href="/one/{token}/{idx}">Download this image</a>
+      <a class="btn" href="#" onclick="window.close(); return false;">Close tab</a>
     </div>
   </div>
   <div class="small"><a href="{img_url}" target="_blank" rel="noopener">Open original</a></div>
   <img src="{img_url}" alt="{filename}">
+  <div class="small" style="margin-top:12px;">Note: “Close tab” only works reliably if the tab was opened by a script. If not, just close it normally.</div>
 </body>
 </html>
 """
